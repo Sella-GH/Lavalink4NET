@@ -1,9 +1,0 @@
-<Project Sdk="Microsoft.NET.Sdk">
-
-  <PropertyGroup />
-
-  <ItemGroup>
-    <ProjectReference Include="..\..\src\Lavalink4NET.Protocol\Lavalink4NET.Protocol.csproj" />
-  </ItemGroup>
-
-</Project>

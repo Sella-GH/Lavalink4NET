@@ -1,9 +1,0 @@
-<Project Sdk="Microsoft.NET.Sdk">
-
-    <PropertyGroup />
-
-    <ItemGroup>
-        <ProjectReference Include="..\..\src\Lavalink4NET.Integrations.ExtraFilters\Lavalink4NET.Integrations.ExtraFilters.csproj" />
-    </ItemGroup>
-
-</Project>

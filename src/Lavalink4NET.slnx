@@ -1,0 +1,29 @@
+<Solution>
+  <Folder Name="/Client Support/">
+    <Project Path="Lavalink4NET.DSharpPlus.Nightly/Lavalink4NET.DSharpPlus.Nightly.csproj" />
+  </Folder>
+  <Folder Name="/Integrations/">
+    <Project Path="Lavalink4NET.Integrations.ExtraFilters/Lavalink4NET.Integrations.ExtraFilters.csproj" />
+    <Project Path="Lavalink4NET.Integrations.Lavasearch/Lavalink4NET.Integrations.Lavasearch.csproj" />
+    <Project Path="Lavalink4NET.Integrations.Lavasrc/Lavalink4NET.Integrations.Lavasrc.csproj" />
+    <Project Path="Lavalink4NET.Integrations.LyricsJava/Lavalink4NET.Integrations.LyricsJava.csproj" />
+    <Project Path="Lavalink4NET.Integrations.SponsorBlock/Lavalink4NET.Integrations.SponsorBlock.csproj" />
+    <Project Path="Lavalink4NET.Integrations.TextToSpeech/Lavalink4NET.Integrations.TextToSpeech.csproj" />
+  </Folder>
+  <Folder Name="/Solution Items/">
+    <File Path="../Directory.Build.props" />
+    <File Path="../Directory.Packages.Net6Overrides.props" />
+    <File Path="../Directory.Packages.Net7Overrides.props" />
+    <File Path="../Directory.Packages.Net8Overrides.props" />
+    <File Path="../Directory.Packages.props" />
+    <File Path="../nuget.config" />
+  </Folder>
+  <Project Path="Lavalink4NET.Abstractions/Lavalink4NET.Abstractions.csproj" />
+  <Project Path="Lavalink4NET.Artwork/Lavalink4NET.Artwork.csproj" />
+  <Project Path="Lavalink4NET.Cluster/Lavalink4NET.Cluster.csproj" />
+  <Project Path="Lavalink4NET.InactivityTracking/Lavalink4NET.InactivityTracking.csproj" />
+  <Project Path="Lavalink4NET.Lyrics/Lavalink4NET.Lyrics.csproj" />
+  <Project Path="Lavalink4NET.Protocol/Lavalink4NET.Protocol.csproj" />
+  <Project Path="Lavalink4NET.Rest/Lavalink4NET.Rest.csproj" />
+  <Project Path="Lavalink4NET/Lavalink4NET.csproj" />
+</Solution>
