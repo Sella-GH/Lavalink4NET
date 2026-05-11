@@ -29,6 +29,18 @@ public class LavalinkPlayer : ILavalinkPlayer, ILavalinkPlayerListener
     private readonly ISystemClock _systemClock;
     private readonly bool _disconnectOnStop;
     private readonly IPlayerLifecycle _playerLifecycle;
+    private readonly bool _enableVoiceAutoReconnect;
+    private readonly TimeSpan _voiceReconnectInitialDelay;
+    private readonly TimeSpan _voiceReconnectAttemptTimeout;
+    private readonly int _voiceReconnectMaxAttempts;
+    private readonly TimeSpan _voiceReconnectCooldown;
+    private readonly bool _disposeOnVoiceReconnectFailure;
+    private readonly bool _selfDeaf;
+    private readonly bool _selfMute;
+    private readonly CancellationTokenSource _playerShutdownCts;
+    private int _voiceRecoveryRunning;
+    private long _lastVoiceReconnectAttemptTicks;
+    private TaskCompletionSource<bool>? _voiceRecoveredTcs;
     private int _disposed;
     private DateTimeOffset _syncedAt;
     private TimeSpan _unstretchedRelativePosition;
@@ -65,6 +77,16 @@ public class LavalinkPlayer : ILavalinkPlayer, ILavalinkPlayerListener
 
         _disconnectOnDestroy = properties.Options.Value.DisconnectOnDestroy;
         _disconnectOnStop = properties.Options.Value.DisconnectOnStop;
+
+        _enableVoiceAutoReconnect = properties.Options.Value.EnableVoiceAutoReconnect;
+        _voiceReconnectInitialDelay = properties.Options.Value.VoiceReconnectInitialDelay;
+        _voiceReconnectAttemptTimeout = properties.Options.Value.VoiceReconnectAttemptTimeout;
+        _voiceReconnectMaxAttempts = properties.Options.Value.VoiceReconnectMaxAttempts;
+        _voiceReconnectCooldown = properties.Options.Value.VoiceReconnectCooldown;
+        _disposeOnVoiceReconnectFailure = properties.Options.Value.DisposeOnVoiceReconnectFailure;
+        _selfDeaf = properties.Options.Value.SelfDeaf;
+        _selfMute = properties.Options.Value.SelfMute;
+        _playerShutdownCts = new CancellationTokenSource();
 
         VoiceServer = new VoiceServer(properties.InitialState.VoiceState.Token, properties.InitialState.VoiceState.Endpoint);
         VoiceState = new VoiceState(properties.VoiceChannelId, properties.InitialState.VoiceState.SessionId);
@@ -432,7 +454,159 @@ public class LavalinkPlayer : ILavalinkPlayer, ILavalinkPlayerListener
 #endif
     }
     
-    protected virtual ValueTask NotifyWebSocketClosedAsync(WebSocketCloseStatus closeStatus, string reason, bool byRemote = false, CancellationToken cancellationToken = default) => default;
+    protected virtual ValueTask NotifyWebSocketClosedAsync(WebSocketCloseStatus closeStatus, string reason, bool byRemote = false, CancellationToken cancellationToken = default)
+    {
+        // Lavalink forwards the Discord voice websocket close code as the websocket close status.
+        // 4014 (Disconnected) and 4015 (Voice server crashed) are recoverable: Discord killed our
+        // voice session but the bot can rejoin by re-asserting the voice state on the gateway.
+        if (!byRemote || !_enableVoiceAutoReconnect)
+        {
+            return default;
+        }
+
+        if (_disposed is not 0)
+        {
+            return default;
+        }
+
+        var closeCode = (int)closeStatus;
+        if (closeCode is not 4014 and not 4015)
+        {
+            return default;
+        }
+
+        if (VoiceChannelId is 0)
+        {
+            return default;
+        }
+
+        var nowTicks = _systemClock.UtcNow.UtcTicks;
+        var cooldownTicks = _voiceReconnectCooldown.Ticks;
+        var lastTicks = Interlocked.Read(ref _lastVoiceReconnectAttemptTicks);
+
+        if (cooldownTicks > 0 && lastTicks != 0 && nowTicks - lastTicks < cooldownTicks)
+        {
+            _logger.VoiceReconnectSkippedCooldown(Label);
+            return default;
+        }
+
+        // Single-flight: only one recovery loop runs per player at a time.
+        if (Interlocked.CompareExchange(ref _voiceRecoveryRunning, 1, 0) is not 0)
+        {
+            return default;
+        }
+
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await RunVoiceRecoveryAsync(_playerShutdownCts.Token).ConfigureAwait(false);
+            }
+            catch (Exception exception)
+            {
+                _logger.VoiceReconnectUnhandled(exception, Label);
+            }
+        });
+
+        return default;
+    }
+
+    private async Task RunVoiceRecoveryAsync(CancellationToken cancellationToken)
+    {
+        try
+        {
+            var delay = _voiceReconnectInitialDelay;
+
+            for (var attempt = 1; attempt <= _voiceReconnectMaxAttempts; attempt++)
+            {
+                if (cancellationToken.IsCancellationRequested || _disposed is not 0 || VoiceChannelId is 0)
+                {
+                    return;
+                }
+
+                if (delay > TimeSpan.Zero)
+                {
+                    try
+                    {
+                        await Task.Delay(delay, cancellationToken).ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        return;
+                    }
+                }
+
+                if (_disposed is not 0 || VoiceChannelId is 0)
+                {
+                    return;
+                }
+
+                // Arm the signal BEFORE sending the voice update so a fast Discord response cannot
+                // be missed by the recovery loop.
+                var tcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+                Volatile.Write(ref _voiceRecoveredTcs, tcs);
+
+                _logger.VoiceReconnectAttempt(Label, attempt, _voiceReconnectMaxAttempts);
+
+                try
+                {
+                    await DiscordClient
+                        .SendVoiceUpdateAsync(GuildId, VoiceChannelId, selfDeaf: _selfDeaf, selfMute: _selfMute, cancellationToken: cancellationToken)
+                        .ConfigureAwait(false);
+                }
+                catch (OperationCanceledException)
+                {
+                    return;
+                }
+                catch (Exception exception)
+                {
+                    _logger.VoiceReconnectSendFailed(exception, Label, attempt);
+                }
+
+                using var attemptCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                attemptCts.CancelAfter(_voiceReconnectAttemptTimeout);
+
+                try
+                {
+                    await tcs.Task.WaitAsync(attemptCts.Token).ConfigureAwait(false);
+                    _logger.VoiceReconnectSucceeded(Label, attempt);
+                    return;
+                }
+                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                {
+                    return;
+                }
+                catch (OperationCanceledException)
+                {
+                    // attempt timed out — try again with backoff
+                    Interlocked.CompareExchange(ref _voiceRecoveredTcs, null, tcs);
+                }
+
+                var nextDelay = TimeSpan.FromTicks(delay.Ticks * 2);
+                delay = nextDelay > TimeSpan.FromSeconds(10) ? TimeSpan.FromSeconds(10) : nextDelay;
+            }
+
+            _logger.VoiceReconnectGaveUp(Label, _voiceReconnectMaxAttempts);
+
+            if (_disposeOnVoiceReconnectFailure && _disposed is 0)
+            {
+                try
+                {
+                    await DisposeAsync().ConfigureAwait(false);
+                }
+                catch (Exception exception)
+                {
+                    _logger.VoiceReconnectDisposeFailed(exception, Label);
+                }
+            }
+        }
+        finally
+        {
+            Volatile.Write(ref _voiceRecoveredTcs, null);
+            Interlocked.Exchange(ref _lastVoiceReconnectAttemptTicks, _systemClock.UtcNow.UtcTicks);
+            Interlocked.Exchange(ref _voiceRecoveryRunning, 0);
+        }
+    }
 
     protected virtual ValueTask NotifyTrackEndedAsync(ITrackQueueItem track, TrackEndReason endReason, CancellationToken cancellationToken = default) => default;
 
@@ -539,6 +713,17 @@ public class LavalinkPlayer : ILavalinkPlayer, ILavalinkPlayerListener
             return;
         }
 
+        // Cancel any in-flight voice recovery loop so it stops awaiting timers/payloads.
+        try
+        {
+            _playerShutdownCts.Cancel();
+        }
+        catch (ObjectDisposedException)
+        {
+        }
+
+        Interlocked.Exchange(ref _voiceRecoveredTcs, null)?.TrySetCanceled();
+
         if (_previousVoiceServer is not null)
         {
             Diagnostics.VoiceServer.Add(-1, KeyValuePair.Create<string, object?>("server", _previousVoiceServer));
@@ -562,6 +747,8 @@ public class LavalinkPlayer : ILavalinkPlayer, ILavalinkPlayerListener
                 .SendVoiceUpdateAsync(GuildId, null, false, false)
                 .ConfigureAwait(false);
         }
+
+        _playerShutdownCts.Dispose();
     }
 
     public async ValueTask DisposeAsync()
@@ -669,17 +856,23 @@ public class LavalinkPlayer : ILavalinkPlayer, ILavalinkPlayerListener
         }
     }
 
-    protected virtual ValueTask NotifyVoiceServerUpdatedAsync(VoiceServer voiceServer, CancellationToken cancellationToken = default)
+    protected virtual async ValueTask NotifyVoiceServerUpdatedAsync(VoiceServer voiceServer, CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
 
         if (_disposed is 1)
         {
-            return ValueTask.CompletedTask;
+            return;
         }
 
         VoiceServer = voiceServer;
-        return UpdateVoiceCredentialsAsync(cancellationToken);
+        await UpdateVoiceCredentialsAsync(cancellationToken).ConfigureAwait(false);
+
+        // Signal any in-flight voice recovery loop that fresh credentials have been pushed to
+        // Lavalink. This is the definitive "we are reconnected" signal — Discord has replied
+        // to our SendVoiceUpdateAsync and we have already patched the player on Lavalink.
+        var tcs = Interlocked.Exchange(ref _voiceRecoveredTcs, null);
+        tcs?.TrySetResult(true);
     }
 
     ValueTask ILavalinkPlayerListener.NotifyVoiceStateUpdatedAsync(VoiceState voiceState, CancellationToken cancellationToken)
@@ -792,6 +985,27 @@ internal static partial class Logging
 
     [LoggerMessage(10, LogLevel.Information, "[{Label}] Player destroyed.", EventName = nameof(PlayerDestroyed))]
     public static partial void PlayerDestroyed(this ILogger<LavalinkPlayer> logger, string label);
+
+    [LoggerMessage(11, LogLevel.Information, "[{Label}] Voice auto-reconnect attempt {Attempt}/{MaxAttempts}.", EventName = nameof(VoiceReconnectAttempt))]
+    public static partial void VoiceReconnectAttempt(this ILogger<LavalinkPlayer> logger, string label, int attempt, int maxAttempts);
+
+    [LoggerMessage(12, LogLevel.Information, "[{Label}] Voice auto-reconnect succeeded on attempt {Attempt}.", EventName = nameof(VoiceReconnectSucceeded))]
+    public static partial void VoiceReconnectSucceeded(this ILogger<LavalinkPlayer> logger, string label, int attempt);
+
+    [LoggerMessage(13, LogLevel.Warning, "[{Label}] Voice auto-reconnect gave up after {MaxAttempts} attempts. The player remains alive; queue and state are preserved.", EventName = nameof(VoiceReconnectGaveUp))]
+    public static partial void VoiceReconnectGaveUp(this ILogger<LavalinkPlayer> logger, string label, int maxAttempts);
+
+    [LoggerMessage(14, LogLevel.Warning, "[{Label}] Voice auto-reconnect send failed on attempt {Attempt}.", EventName = nameof(VoiceReconnectSendFailed))]
+    public static partial void VoiceReconnectSendFailed(this ILogger<LavalinkPlayer> logger, Exception exception, string label, int attempt);
+
+    [LoggerMessage(15, LogLevel.Debug, "[{Label}] Voice auto-reconnect skipped: within cooldown window.", EventName = nameof(VoiceReconnectSkippedCooldown))]
+    public static partial void VoiceReconnectSkippedCooldown(this ILogger<LavalinkPlayer> logger, string label);
+
+    [LoggerMessage(16, LogLevel.Warning, "[{Label}] Voice auto-reconnect dispose failed.", EventName = nameof(VoiceReconnectDisposeFailed))]
+    public static partial void VoiceReconnectDisposeFailed(this ILogger<LavalinkPlayer> logger, Exception exception, string label);
+
+    [LoggerMessage(17, LogLevel.Error, "[{Label}] Unhandled exception in voice auto-reconnect loop.", EventName = nameof(VoiceReconnectUnhandled))]
+    public static partial void VoiceReconnectUnhandled(this ILogger<LavalinkPlayer> logger, Exception exception, string label);
 }
 
 file static class Diagnostics
